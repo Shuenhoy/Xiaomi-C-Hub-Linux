@@ -1,0 +1,42 @@
+# Xiaomi C-HUB —— USB 访问权限
+#
+# 音箱的厂商配置接口（interface 4）是 HID class 但没有端点，
+# Linux usbhid 无法为它创建 /dev/hidraw 节点，程序必须用 libusb
+# 直接对 /dev/bus/usb/BBB/DDD 做控制传输。默认只有 root 可读写，
+# 因此需要这条规则把设备交给当前登录用户。
+#
+# 安装：
+#   sudo cp udev/60-xiaomi-c-hub.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+# 然后重新插拔音箱。
+#
+# 说明：TAG+="uaccess" 由 systemd-logind 负责把 ACL 授给当前活动会话用户，
+# 比硬编码 GROUP 更通用（不依赖 plugdev 组是否存在）。
+
+# B03 系列全部 PID
+# 0xd003 0xd004 0xd00b 0xd00c  中文版
+# 0xd007 0xd008               英文版
+# 0xd009 0xd00a               套装版
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  ATTR{idProduct}=="d003", TAG+="uaccess", MODE="0660"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  ATTR{idProduct}=="d004", TAG+="uaccess", MODE="0660"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  ATTR{idProduct}=="d007", TAG+="uaccess", MODE="0660"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  ATTR{idProduct}=="d008", TAG+="uaccess", MODE="0660"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  ATTR{idProduct}=="d009", TAG+="uaccess", MODE="0660"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  ATTR{idProduct}=="d00a", TAG+="uaccess", MODE="0660"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  ATTR{idProduct}=="d00b", TAG+="uaccess", MODE="0660"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  ATTR{idProduct}=="d00c", TAG+="uaccess", MODE="0660"
+
+# 已知 PID 之外的型号也放开（hidraw 已有节点时用它）
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2717", \
+  TAG+="uaccess", MODE="0660"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2717", \
+  TAG+="uaccess", MODE="0660"

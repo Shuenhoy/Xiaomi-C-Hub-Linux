@@ -1,0 +1,6 @@
+# 解包产物（体积大，由 scripts/unpack.sh 生成）
+/work/
+/dist/
+
+# MSIX 安装包本体
+*.Msix
