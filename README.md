@@ -13,7 +13,8 @@
 |------|------|
 | 窗口 / 界面 / 中英文 i18n / 图标 / 字体 | ✅ 完全正常 |
 | 主进程逻辑、IPC、pinia store | ✅ 完全正常 |
-| 读取音箱配置、调音量 / 灯效 / EQ | ⚠️ 需要装 udev 规则（见下） |
+| 连接音箱、读取全部配置 | ✅ 正常（音量 / 灯效 / EQ / 睡眠 / 固件版本都能读） |
+| 音量、灯效、亮度、均衡器写入 | ✅ 已在真机验证，设备回读一致 |
 | 固件升级 | ⚠️ 依赖 Windows PE 烧写工具，走 wine，未完整验证 |
 
 **唯一的硬性前提：安装 `udev/60-xiaomi-c-hub.rules`。**
@@ -85,11 +86,54 @@ selectConfiguration / claimInterface / "interface 4 claimed" / "interface 0 clai
 实际做的控制传输是：
 
 ```
-GET_REPORT   bmRequestType=0xA1  bRequest=0x01  wValue=0x0300|reportId  wIndex=4
-SET_REPORT   bmRequestType=0x21  bRequest=0x09  wValue=0x0300|reportId  wIndex=4
+GET_REPORT   bmRequestType=0xA1  bRequest=0x01  wValue=0x0300  wIndex=4  wLength=128
+SET_REPORT   bmRequestType=0x21  bRequest=0x09  wValue=0x0200  wIndex=4  len=128
 ```
 
 这条路只需要 `/dev/bus/usb/BBB/DDD` 的读写权限，**不需要 hidraw**。
+
+不过 `node-hid.devices()` 那一步程序仍然会走：它要找
+`usagePage == 0xFF00 && usage == 0x55AA` 的设备确认"厂商接口在线"，
+找不到就静默放弃（连界面都不切换）。Linux 上这个设备永远不存在，
+所以需要 `xiaomi-hid.cjs` **合成一个挂在这个 filter 上的假设备**，
+真正的读写全部由它用 libusb 完成。这部分默认开启。
+
+### 2.1 读写通道的两个坑（都是实测出来的）
+
+**读必须精确 128 字节。** 报告描述符为：
+
+```
+06 00 ff 0a aa 55 a1 01 15 00 26 ff 00 75 08 96 00 01 09 01 81 02
+96 00 01 09 01 91 02 95 80 09 01 b1 02 c0
+```
+
+即 Input 256B、Output 256B、**Feature 128B**，无 report ID。用 129 或
+22 字节去 GET_REPORT 只会拿到默认帧 `00 01 00 03 04 00 80 ...`；
+**只有 128 字节**才返回真正的应答 `A5 5A FC 62 90 03 30 01 01 31 ... 16`，
+其中 `[3] == 0x62` 正是渲染层 `initSpeakerConfig()` 需要的 `dataLength`
+（之前 UI 参数全空就是这个原因）。
+
+**写必须走 Output report（`wValue=0x0200`），不是 Feature report。**
+同一个帧用 `0x0300` 写，设备直接丢弃并回空帧；用 `0x0200` 就立刻生效。
+这是整个移植里最不直观的一处 —— 程序调用的 API 叫
+`sendFeatureReport`，Windows 上走 `HidD_SetFeature` 能用，换成 libusb
+就必须改成 Output report 才能对得上设备固件的行为。
+
+B03 系列的写入帧是 8 字节，**没有 size 字段**：
+
+```
+[0xA5, 0x5A, 0xFC, 0x03, <paramId>, 0x02, <value>, 0x16]
+```
+
+实测有效的几组（设备回读完全一致）：
+
+| 功能 | paramId | 帧示例 |
+|------|---------|--------|
+| 音量（0–16，×6 = 百分比） | 0x74 (116) | `a5 5a fc 03 74 02 05 16` → 30% |
+| 灯效模式 | 0x30 (48) | `a5 5a fc 03 30 02 02 16` |
+| 亮度 | 0x31 (49) | `a5 5a fc 03 31 02 04 16` |
+| 均衡器 10 段 | 0x8C (140) | `a5 5a fc 0c 8c 02 06 06 ... 16`（17 字节） |
+
 
 ### 3. 为什么必须装 udev 规则
 
@@ -129,15 +173,16 @@ sudo udevadm trigger
 └── dist/electron/             # build.sh 产物（可直接运行）
 ```
 
-`linux-shim.cjs` 默认只做**诊断**（记录 `Device.open()` 失败原因、把
-`LIBUSB_ERROR_ACCESS` 换成能看懂的提示）。它不改变程序行为 —— 因为程序
-本来就走 libusb，不需要替换。另有两个可选开关：
+`linux-shim.cjs` 默认做两件事：**诊断**（记录 `Device.open()` 失败原因、
+把 `LIBUSB_ERROR_ACCESS` 换成能看懂的提示）和 **node-hid 回退**
+（`xiaomi-hid.cjs` 让程序在 Linux 上也能完成设备识别与读写）。
+另有两个可选开关：
 
 | 环境变量 | 作用 |
 |---------|------|
 | `XIAOMI_C_HUB_DEBUG=1` | 写日志到 `/tmp/xiaomi-c-hub-shim.log` |
 | `XIAOMI_C_HUB_WINE=1` | 对 `.exe` 的 spawn 改走 wine，并把 `getPlatform` 伪装成 win32，让固件升级入口显示 |
-| `XIAOMI_C_HUB_HID_FALLBACK=1` | 用 `xiaomi-hid.cjs` 给 node-hid 注入合成设备（B02 系列可能需要） |
+| `XIAOMI_C_HUB_HID_FALLBACK=0` | 关闭合成 HID 设备（用于对比原生行为，正常使用不要关） |
 
 ## 调试
 

@@ -22,7 +22,11 @@ for d in /sys/bus/usb/devices/*; do
   break
 done
 
-if [ -n "$node" ] && [ -c "$node" ] && { [ ! -r "$node" ] || [ ! -w "$node" ]; }; then
+if [ -z "$node" ]; then
+  echo "提示：没有找到小米音箱（VID 2717），程序会显示“未连接”。" >&2
+  echo "      确认音箱已通电、USB 已插好；长时间不用会进入待机，按一下音箱电源即可。" >&2
+  echo >&2
+elif [ -c "$node" ] && { [ ! -r "$node" ] || [ ! -w "$node" ]; }; then
   echo "警告：没有 $node 的读写权限，程序会显示“未连接”。" >&2
   echo "      请运行 ./scripts/install.sh 安装 udev 规则，然后拔插音箱。" >&2
   echo >&2
