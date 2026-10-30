@@ -84,6 +84,34 @@ const FEATURE_REPORT_SIZE = 128;
 /** Output report 也是 256 字节（同描述符），写入时补齐到这长度即可 */
 const OUTPUT_REPORT_SIZE = 128;
 
+/**
+ * 修正状态帧第 3 字节（长度字段）。
+ *
+ * 设备返回的 `A5 5A FC <len> ... 16` 里，<len> 会少报 4 个字节：
+ * 声明的 body 到不了终止符 0x16，末尾还会剩下 `01 8f 01 00 16`（键盘 143）。
+ * 渲染层 initSpeakerConfig() 用 `result.slice(6, 6 + result[3])` 解析，
+ * 于是会漏掉最后两个参数 142（powerNoticeFlag）与 143（mixLineChannelFlag）。
+ *
+ * 受影响的实际行为：Home 里「混合输入」通道是否可选由
+ * `channelStatus[3] == 0 || mixLineChannelFlag === 0` 决定，
+ * 一旦漏读就永远是 0，用户开了混合输入也选不到那个通道。
+ *
+ * 这里按终止符反推真实 body 长度回填，其余字节不动。
+ */
+function fixStateFrameLength(frame) {
+  if (!frame || frame.length < 8) return frame;
+  if (frame[0] !== 0xa5 || frame[1] !== 0x5a || frame[2] !== 0xfc) return frame;
+  let end = frame.length - 1;
+  while (end > 6 && frame[end] === 0) end -= 1;
+  if (frame[end] !== 0x16) return frame;         // 没有终止符，不敢改
+  const actual = end - 6;
+  if (actual <= 0 || frame[3] === actual) return frame;
+  const fixed = Buffer.from(frame);
+  log(`状态帧长度低报：声明 ${frame[3]}，实测 ${actual}，已回填`);
+  fixed[3] = actual;
+  return fixed;
+}
+
 /** 音箱对连续 SET_REPORT 会间歇性 STALL，重试一次即可恢复 */
 function withRetry(fn, attempts = 4) {
   let lastError;
@@ -285,8 +313,9 @@ class XiaomiHidDevice extends EventEmitter {
         FEATURE_REPORT_SIZE
       ).then((got) => {
         // 渲染层按 result[0..] 直接解析应答帧，不能在前面加 report id
-        log(`GET_REPORT id=0x${(reportId || 0).toString(16)} -> ${hex(got)}`);
-        return got;
+        const frame = fixStateFrameLength(got);
+        log(`GET_REPORT id=0x${(reportId || 0).toString(16)} -> ${hex(frame)}`);
+        return frame;
       })
     ).finally(() => setTimeout(release, 0));
   }
