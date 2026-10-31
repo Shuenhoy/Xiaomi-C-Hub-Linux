@@ -84,6 +84,28 @@ const FEATURE_REPORT_SIZE = 128;
 /** Output report 也是 256 字节（同描述符），写入时补齐到这长度即可 */
 const OUTPUT_REPORT_SIZE = 128;
 
+/** INPUT report 是 256 字节（蓝牙模式下唯一能读到真实状态帧的通道） */
+const INPUT_REPORT_SIZE = 256;
+
+/** 记下哪种读法有效，避免每秒都做无用的探测；设备重新枚举时清空 */
+let preferredReadPath = null; // 'feature' | 'request-70'
+
+/**
+ * 判断一段数据是不是设备返回的**状态帧**（`A5 5A FC <len> <cmd> ... 16`）。
+ *
+ * 注意要排除「应答回显帧」：蓝牙模式下设备只回
+ * `A5 5A FC 01 <cmd> 03 16`（body 只有 1 字节），那里面没有任何参数。
+ * 真正的状态帧 body 至少几十字节，所以用长度下限区分。
+ */
+function isStateFrame(buf) {
+  if (!buf || buf.length < 8) return false;
+  if (buf[0] !== 0xa5 || buf[1] !== 0x5a || buf[2] !== 0xfc) return false;
+  let end = buf.length - 1;
+  while (end > 6 && buf[end] === 0) end -= 1;
+  if (buf[end] !== 0x16) return false;
+  return end - 6 >= 16;
+}
+
 /**
  * 修正状态帧第 3 字节（长度字段）。
  *
@@ -222,10 +244,31 @@ function readReportDescriptor(device, interfaceNumber) {
 
 let shared = null; // { device, iface, refs }
 
+/** 同一个物理设备在重新枚举后会换地址，用它判断句柄是否还新鲜 */
+function identityOf(device) {
+  if (!device) return null;
+  return `${device.busNumber}:${device.deviceAddress}`;
+}
+
+/** 设备掉线 / 重新枚举后旧句柄会失效，必须丢弃重开 */
+function invalidate() {
+  preferredReadPath = null;
+  if (!shared) return;
+  try { shared.device.close(); } catch (_) { /* ignore */ }
+  shared = null;
+}
+
 function acquire() {
   if (shared) {
-    shared.refs += 1;
-    return shared;
+    // 换通道时音箱会重新枚举（PID 和接口布局都会变），
+    // 旧句柄上所有传输都会变成 LIBUSB_ERROR_NO_DEVICE，这里先校验一次
+    const current = findDevice();
+    if (current && identityOf(current.device) === identityOf(shared.device)) {
+      shared.refs += 1;
+      return shared;
+    }
+    log('设备地址已变化（重新枚举），重建句柄');
+    invalidate();
   }
 
   const found = findDevice();
@@ -303,21 +346,89 @@ class XiaomiHidDevice extends EventEmitter {
   getFeatureReport(reportId, reportLength) {
     if (!this._open) throw new Error('Unable to read from a closed HID device');
     const handle = acquire();
-    return withRetry(() =>
-      transferIn(
-        handle.device,
-        REQUEST_TYPE.classIn,
-        0x01,                                // GET_REPORT
-        0x0300 | ((reportId || 0) & 0xff),   // feature report
-        ifaceNumber(handle.iface),
-        FEATURE_REPORT_SIZE
-      ).then((got) => {
-        // 渲染层按 result[0..] 直接解析应答帧，不能在前面加 report id
-        const frame = fixStateFrameLength(got);
-        log(`GET_REPORT id=0x${(reportId || 0).toString(16)} -> ${hex(frame)}`);
-        return frame;
-      })
-    ).finally(() => setTimeout(release, 0));
+    const requestType = 0x0300 | ((reportId || 0) & 0xff);
+
+    // 设备会随输入通道重新枚举：
+    //   USB 通道 → PID d009，5 个接口，Feature report 能读到真实状态帧
+    //   蓝牙通道 → PID d00a，只剩 1 个 HID 接口，Feature report 恒返回默认帧
+    //              `00 01 00 03 00 00 80 ...`，只有 INPUT report 能读到真实帧
+    // 所以两条读法都要试，谁先拿到合法帧就用谁。
+    const readFeature = () => transferIn(
+      handle.device, REQUEST_TYPE.classIn, 0x01, requestType,
+      ifaceNumber(handle.iface), FEATURE_REPORT_SIZE
+    );
+    const readInput = () => transferIn(
+      handle.device, REQUEST_TYPE.classIn, 0x01, 0x0100,
+      ifaceNumber(handle.iface), INPUT_REPORT_SIZE
+    );
+
+    /** 自己补发一条状态查询（渲染层用的是 0x90，蓝牙模式下只有 0x70 有应答） */
+    const sendStateQuery = async (cmd) => {
+      const frame = Buffer.alloc(OUTPUT_REPORT_SIZE);
+      Buffer.from([0xa5, 0x5a, 0xfc, 0x03, cmd, 0x03, 0x00, 0x16]).copy(frame);
+      try {
+        const written = await transferOut(
+          handle.device, REQUEST_TYPE.classOut, 0x09, 0x0200,
+          ifaceNumber(handle.iface), frame
+        );
+        log(`补发状态查询 0x${cmd.toString(16)} -> ${written}`);
+      } catch (e) {
+        log(`补发状态查询 0x${cmd.toString(16)} 失败: ${e.message}`);
+      }
+    };
+
+    const attemptRead = async () => {
+      for (let i = 0; i < 4; i += 1) {
+        // 已知 feature 走不通就直接跳过，省一次无用的控制传输
+        if (preferredReadPath !== 'request-70') {
+          let viaFeature = null;
+          try { viaFeature = await readFeature(); } catch (e) { log('FEATURE 读失败: ' + e.message); }
+          if (isStateFrame(viaFeature)) {
+            preferredReadPath = 'feature';
+            const frame = fixStateFrameLength(viaFeature);
+            log(`GET_REPORT(feature) -> ${hex(frame)}`);
+            return frame;
+          }
+        }
+        // feature 拿不到真实帧时，用 INPUT report 读。
+        // 设备刚收到查询命令时第一次 INPUT 常常只是回显（body 长度 1），需要多读几次。
+        for (let j = 0; j < 3; j += 1) {
+          let viaInput = null;
+          try { viaInput = await readInput(); } catch (e) { log('INPUT 读失败: ' + e.message); }
+          if (isStateFrame(viaInput)) {
+            const frame = fixStateFrameLength(viaInput);
+            log(`GET_REPORT(input) -> ${hex(frame)}`);
+            return frame;
+          }
+          await new Promise((r) => setTimeout(r, 60));
+        }
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      return null;
+    };
+
+    const attempt = async () => {
+      const first = await attemptRead();
+      if (first) return first;
+
+      // 还没拿到状态帧。渲染层发的是 0x90 查询，但这个固件只对 0x70 回完整状态，
+      // 0x90 只回 1 字节回显。补发一次 0x70 再读。
+      await sendStateQuery(0x70);
+      await new Promise((r) => setTimeout(r, 150));
+      const second = await attemptRead();
+      if (second) {
+        preferredReadPath = 'request-70';
+        return second;
+      }
+
+      // 都失败就返回 Feature 的原始结果（默认帧），交给上层按空配置处理
+      preferredReadPath = null;
+      const fallback = await readFeature().catch(() => Buffer.alloc(FEATURE_REPORT_SIZE));
+      log(`GET_REPORT 未取到合法状态帧 -> ${hex(fallback)}`);
+      return fixStateFrameLength(fallback);
+    };
+
+    return withRetry(attempt).finally(() => setTimeout(release, 0));
   }
 
   /**
@@ -335,6 +446,20 @@ class XiaomiHidDevice extends EventEmitter {
     const handle = acquire();
     const raw = Buffer.from(Array.from(data));
     const body = raw.length && raw[0] === 0 ? raw.subarray(1) : raw;
+
+    // 渲染层的状态查询是 `A5 5A FC 03 90 03 00 16`，但当前固件对 0x90
+    // 只回 1 字节回显，只有 0x70 会回完整状态帧。一旦确认 0x90 不可用，
+    // 就把查询改写成 0x70，省掉「先发 0x90、失败、再补发 0x70」的一轮往返。
+    if (
+      body.length >= 6 &&
+      body[0] === 0xa5 && body[1] === 0x5a && body[2] === 0xfc &&
+      body[4] === 0x90 && body[5] === 0x03 &&
+      preferredReadPath === 'request-70'
+    ) {
+      body[4] = 0x70;
+      log('状态查询 0x90 改写为 0x70');
+    }
+
     const buf = Buffer.alloc(Math.max(OUTPUT_REPORT_SIZE, body.length));
     body.copy(buf, 0, 0, body.length);
     return withRetry(() =>
